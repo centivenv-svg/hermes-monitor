@@ -1,0 +1,296 @@
+name: Hermes Monitor
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hermes-monitor
+  cancel-in-progress: false
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Playwright
+        run: |
+          python -m pip install --upgrade pip
+          pip install playwright==1.60.0
+          playwright install --with-deps chromium
+
+      - name: Restore state
+        uses: actions/cache/restore@v4
+        with:
+          path: state.json
+          key: hermes-state-${{ github.run_id }}
+          restore-keys: |
+            hermes-state-
+
+      - name: Scan Hermes
+        env:
+          BARK_KEY: ${{ secrets.BARK_KEY }}
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import re
+          import time
+          import urllib.parse
+          import urllib.request
+          from pathlib import Path
+          from playwright.sync_api import sync_playwright
+
+          TARGETS = [
+              {"name": "Mini Kelly", "pattern": r"mini\s+kelly|kelly\s+mini"},
+              {"name": "Bolide 1923 Mini", "pattern": r"bolide\s*1923\s*(mini|-?\s*20)"},
+          ]
+
+          CATEGORY_URLS = [
+              "https://www.hermes.com/it/it/category/pelletteria/borse-e-pochette/borse-e-pochette-da-donna/",
+              "https://www.hermes.com/it/it/category/pelletteria/borse-e-pochette/borse-e-pochette-da-uomo/",
+              "https://www.hermes.com/it/it/category/pelletteria/borse-e-pochette/borse-e-pochette-da-donna/?facet_line=bolide",
+          ]
+
+          PRODUCT_URLS = [
+              "https://www.hermes.com/it/it/product/borsa-bolide-1923-mini-H075180CCV8/",
+          ]
+
+          STATE_PATH = Path("state.json")
+
+          def log(*args):
+              print(*args, flush=True)
+
+          def clean(text):
+              return re.sub(r"\s+", " ", text or "").strip()
+
+          def status_from_text(text):
+              low = text.lower()
+              if "esaurito" in low or "non disponibile" in low:
+                  return "sold_out"
+              if "aggiungi al carrello" in low or "add to cart" in low:
+                  return "available"
+              if "disponibile a breve" in low or "coming soon" in low:
+                  return "coming_soon"
+              return "listed"
+
+          def item_id(url):
+              return hashlib.sha1(url.encode("utf-8")).hexdigest()[:16]
+
+          def send_bark(title, body, url):
+              key = os.getenv("BARK_KEY", "").strip()
+              if not key:
+                  log("[bark] BARK_KEY missing")
+                  return
+              path = urllib.parse.quote(title, safe="") + "/" + urllib.parse.quote(body, safe="")
+              params = {
+                  "group": "Hermes",
+                  "level": "timeSensitive",
+                  "sound": "alarm",
+                  "url": url,
+              }
+              endpoint = (
+                  "https://api.day.app/"
+                  + urllib.parse.quote(key, safe="")
+                  + "/"
+                  + path
+                  + "?"
+                  + urllib.parse.urlencode(params)
+              )
+              try:
+                  with urllib.request.urlopen(endpoint, timeout=20) as response:
+                      log("[bark]", response.read(300).decode("utf-8", "ignore"))
+              except Exception as exc:
+                  log("[bark] failed:", exc)
+
+          def accept_cookies(page):
+              for label in ("ACCETTA TUTTI I COOKIE", "Accetta tutti i cookie"):
+                  try:
+                      button = page.get_by_role("button", name=re.compile(label, re.I))
+                      if button.count() and button.first.is_visible():
+                          button.first.click(timeout=2000)
+                          page.wait_for_timeout(800)
+                          return
+                  except Exception:
+                      pass
+
+          def scan_category(page, url):
+              response = None
+              for attempt in range(3):
+                  try:
+                      response = page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                      if response and response.status == 200:
+                          break
+                  except Exception as exc:
+                      log("[category] retry:", url, exc)
+                  page.wait_for_timeout(5000)
+
+              if not response or response.status != 200:
+                  log("[category] skipped HTTP", response.status if response else "ERR", url)
+                  return []
+
+              page.wait_for_timeout(2500)
+              accept_cookies(page)
+
+              for _ in range(4):
+                  page.mouse.wheel(0, 1600)
+                  page.wait_for_timeout(700)
+
+              products = {}
+              for link in page.query_selector_all('a[href*="/product/"]'):
+                  href = link.get_attribute("href") or ""
+                  if not href:
+                      continue
+                  if href.startswith("/"):
+                      href = "https://www.hermes.com" + href
+                  if href in products:
+                      continue
+
+                  title = clean(link.inner_text())
+                  card_text = clean(
+                      link.evaluate(
+                          "el => { let n = el; for (let i = 0; i < 5 && n; i++) { n = n.parentElement; } return n ? n.innerText : ''; }"
+                      )
+                  )
+                  products[href] = {
+                      "url": href,
+                      "title": title,
+                      "text": card_text,
+                  }
+              return list(products.values())
+
+          def scan_product(page, url):
+              response = None
+              for attempt in range(3):
+                  try:
+                      response = page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                      if response and response.status == 200:
+                          break
+                  except Exception as exc:
+                      log("[product] retry:", url, exc)
+                  page.wait_for_timeout(5000)
+
+              log("[product] HTTP", response.status if response else "ERR", url)
+              if not response or response.status != 200:
+                  return None
+
+              page.wait_for_timeout(2500)
+              accept_cookies(page)
+              body = clean(page.inner_text("body"))
+              title = clean(page.title()).replace(" | Hermès Italia", "")
+              return {
+                  "url": page.url,
+                  "title": title,
+                  "text": body[:1200],
+              }
+
+          def find_matches(products):
+              result = {}
+              for product in products:
+                  haystack = (product["title"] + " " + product["text"]).lower()
+                  for target in TARGETS:
+                      if re.search(target["pattern"], haystack, re.I):
+                          result[product["url"]] = {
+                              "url": product["url"],
+                              "title": product["title"],
+                              "target": target["name"],
+                              "status": status_from_text(product["text"]),
+                              "id": item_id(product["url"]),
+                          }
+                          break
+              return result
+
+          def main():
+              matches = {}
+
+              with sync_playwright() as playwright:
+                  browser = playwright.chromium.launch(headless=True)
+                  context = browser.new_context(
+                      locale="it-IT",
+                      timezone_id="Europe/Rome",
+                      user_agent=(
+                          "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                          "AppleWebKit/537.36 (KHTML, like Gecko) "
+                          "Chrome/148.0.0.0 Safari/537.36"
+                      ),
+                      extra_http_headers={
+                          "Accept-Language": "it-IT,it;q=0.9,en;q=0.8"
+                      },
+                  )
+                  page = context.new_page()
+
+                  for url in CATEGORY_URLS:
+                      try:
+                          products = scan_category(page, url)
+                          found = find_matches(products)
+                          log("[category]", url, "products", len(products), "matches", len(found))
+                          matches.update(found)
+                      except Exception as exc:
+                          log("[category] failed:", url, exc)
+
+                  for url in PRODUCT_URLS:
+                      try:
+                          product = scan_product(page, url)
+                          if product:
+                              found = find_matches([product])
+                              log("[product]", url, "matches", len(found))
+                              matches.update(found)
+                      except Exception as exc:
+                          log("[product] failed:", url, exc)
+
+                  browser.close()
+
+              if STATE_PATH.exists():
+                  try:
+                      state = json.loads(STATE_PATH.read_text(encoding="utf-8"))
+                  except Exception:
+                      state = {"products": {}}
+              else:
+                  state = {"products": {}}
+
+              known = state.setdefault("products", {})
+              alerts = 0
+
+              for item in matches.values():
+                  old = known.get(item["id"])
+                  changed = old is None or old.get("status") != item["status"]
+
+                  known[item["id"]] = {
+                      "title": item["title"],
+                      "status": item["status"],
+                      "last_seen": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                  }
+
+                  if changed and item["status"] in ("available", "coming_soon", "listed"):
+                      alerts += 1
+                      body = item["title"] + " | " + item["status"] + " | " + item["url"]
+                      log("[ALERT]", body)
+                      send_bark("Hermès: " + item["target"], body, item["url"])
+
+              state["last_run"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+              STATE_PATH.write_text(
+                  json.dumps(state, ensure_ascii=False, indent=2),
+                  encoding="utf-8",
+              )
+              log("[done] alerts:", alerts)
+
+          main()
+          PY
+
+      - name: Save state
+        if: always() && hashFiles('state.json') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: state.json
+          key: hermes-state-${{ github.run_id }}
