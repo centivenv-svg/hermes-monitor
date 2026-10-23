@@ -54,7 +54,17 @@ jobs:
 
           TARGETS = [
               {"name": "Mini Kelly", "pattern": r"mini\s+kelly|kelly\s+mini"},
+              {"name": "Mini Lindy", "pattern": r"mini\s+lindy|lindy\s+mini"},
               {"name": "Bolide 1923 Mini", "pattern": r"bolide\s*1923\s*(mini|-?\s*20)"},
+              {"name": "Constance 18/24", "pattern": r"borsa\s+constance\s*(18|24|mini)|constance\s+(18|24|mini)"},
+              {"name": "Picotin Lock 18/22", "pattern": r"borsa\s+picotin|picotin\s*(lock)?\s*(18|22)"},
+              {"name": "Kelly 25", "pattern": r"borsa\s+kelly\s+25|kelly\s+25"},
+              {"name": "Birkin 25", "pattern": r"borsa\s+birkin\s+25|birkin\s+25"},
+              {"name": "Roulis Mini", "pattern": r"roulis\s+mini|mini\s+roulis"},
+              {"name": "Della Cavalleria Mini", "pattern": r"della\s+cavalleria\s+mini"},
+              {"name": "In-the-Loop 18", "pattern": r"in-the-loop\s*18"},
+              {"name": "Evelyne 16/TPM", "pattern": r"evelyne\s*(16|tpm)"},
+              {"name": "Herbag 20/31", "pattern": r"herbag\s*(20|31)|herbag\s+(mini|pm)"},
           ]
           CATEGORY_URLS = [
               "https://www.hermes.com/it/it/category/pelletteria/borse-e-pochette/borse-e-pochette-da-donna/",
